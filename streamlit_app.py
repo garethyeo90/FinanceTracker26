@@ -35,11 +35,9 @@ html, body {background-color:#0e1117;}
 # Helpers
 # ============================================================
 def money_to_float(s: str) -> float:
-    """Convert money-ish strings to float (handles commas, - 123, (123))."""
     if s is None:
         return 0.0
-    s = str(s).strip()
-    s = s.replace(",", "").replace("−", "-").replace("- ", "-")
+    s = str(s).strip().replace(",", "").replace("−", "-").replace("- ", "-")
     if s.startswith("(") and s.endswith(")"):
         s = "-" + s[1:-1]
     if s in {"", "-"}:
@@ -65,15 +63,14 @@ def dark_plot(fig):
 
 def direction_to_side(direction: str) -> str:
     d = (direction or "").strip().lower()
-    if "sell" in d:
+    if d.startswith("sell"):
         return "SELL"
-    if "buy" in d:
+    if d.startswith("buy"):
         return "BUY"
     return "UNKNOWN"
 
 
 def is_options_symbol(code: str) -> bool:
-    """Option codes often look like SPY260123P665000."""
     if not code:
         return False
     s = str(code).strip().upper().replace(" ", "")
@@ -81,7 +78,6 @@ def is_options_symbol(code: str) -> bool:
 
 
 def parse_option_code(code: str) -> Dict[str, Optional[object]]:
-    """Parse option symbol: SPY260123P665000 -> underlying=SPY, expiry=2026-01-23, type=P, strike=665.0"""
     code = (code or "").strip().upper().replace(" ", "")
     m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d+)$", code)
     if not m:
@@ -104,10 +100,6 @@ def parse_option_code(code: str) -> Dict[str, Optional[object]]:
 
 
 def extract_account_summary(all_text: str) -> Dict[str, float]:
-    """
-    Pull out key figures from page text.
-    Uses looser regex to handle newlines/spaces.
-    """
     out: Dict[str, float] = {}
 
     m = re.search(r"Net Asset Value[\s:]*([\d,]+\.\d+)", all_text, flags=re.IGNORECASE)
@@ -122,7 +114,6 @@ def extract_account_summary(all_text: str) -> Dict[str, float]:
     if m:
         out["cash_balance"] = money_to_float(m.group(1))
 
-    # Starting NAV (SGD equal)
     m = re.search(
         r"Starting Net Asset Value\s*\d+.*?Equal to\(SGD\)\s*([\d,]+\.\d+)",
         all_text,
@@ -131,20 +122,11 @@ def extract_account_summary(all_text: str) -> Dict[str, float]:
     if m:
         out["nav_start"] = money_to_float(m.group(1))
 
-    # Ending NAV (SGD equal)
-    m = re.search(
-        r"Ending Net Asset Value\s*\d+.*?Equal to\(SGD\)\s*([\d,]+\.\d+)",
-        all_text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        out["nav_end_sgd_equal"] = money_to_float(m.group(1))
-
     return out
 
 
 # ============================================================
-# Trade parsing (text-line scanner)
+# Trade parsing tailored to your moomoo PDF layout
 # ============================================================
 @dataclass
 class ParsedTrade:
@@ -160,65 +142,61 @@ class ParsedTrade:
     group_id: int
 
 
-def _extract_datetime_from_block(block_text: str) -> Optional[pd.Timestamp]:
+def parse_trades_from_text_lines(lines: List[str]) -> Tuple[List[ParsedTrade], pd.DataFrame]:
     """
-    Fix: moomoo PDF often has DATE and TIME on different lines.
-    Our block_text joins lines with ' | ', so we support:
-      - 'YYYY/MM/DD HH:MM:SS'
-      - 'YYYY/MM/DD | HH:MM:SS'
-      - date anywhere + time anywhere
+    Handles moomoo layout:
+      descriptor line contains date, e.g. "BRKB 260918 430.00C 2025/12/05"
+      trade line contains direction+currency+price+qty+amount
+      next line contains option_code + time, e.g. "BRKB260918C430000 22:34:31"
+      (for equities, next line might be "SPY 13:49:16")
+    Also allocates fees by "Subtotal" group.
     """
-    # 1) same line
-    m = re.search(r"(\d{4}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})", block_text)
-    if m:
-        return pd.to_datetime(m.group(1) + " " + m.group(2), format="%Y/%m/%d %H:%M:%S", errors="coerce")
-
-    # 2) date | time
-    m = re.search(r"(\d{4}/\d{2}/\d{2})\s*\|\s*(\d{2}:\d{2}:\d{2})", block_text)
-    if m:
-        return pd.to_datetime(m.group(1) + " " + m.group(2), format="%Y/%m/%d %H:%M:%S", errors="coerce")
-
-    # 3) date anywhere + time anywhere
-    d = re.search(r"(\d{4}/\d{2}/\d{2})", block_text)
-    t = re.search(r"(\d{2}:\d{2}:\d{2})", block_text)
-    if d and t:
-        return pd.to_datetime(d.group(1) + " " + t.group(1), format="%Y/%m/%d %H:%M:%S", errors="coerce")
-
-    return None
-
-
-def parse_trades_from_text_lines(lines: List[str]) -> Tuple[List[ParsedTrade], List[Dict[str, float]]]:
     trades: List[ParsedTrade] = []
     fee_groups: List[Dict[str, float]] = []
 
-    dir_pat = re.compile(r"^(Buy|Sell)\s+to\s+(Open|Close)$", re.IGNORECASE)
-    subtotal_pat = re.compile(r"^Subtotal:\s*([\d,]+\.\d+)", re.IGNORECASE)
+    # Trade line (direction embedded in same line)
+    trade_line_pat = re.compile(
+        r"^(Buy|Sell)\s+to\s+(Open|Close)\s+.*?\b(USD|SGD|HKD|CNH|JPY)\b\s+"
+        r"(-?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+([\d,]+\.\d+)\s*$",
+        re.IGNORECASE
+    )
 
+    # Descriptor date at end of line
+    date_pat = re.compile(r"(\d{4}/\d{2}/\d{2})\s*$")
+
+    # Next-line formats
+    opt_code_time_pat = re.compile(r"^([A-Z]+(?:\d{6})[CP]\d+)\s+(\d{2}:\d{2}:\d{2})\s*$")
+    ticker_time_pat = re.compile(r"^([A-Z]{1,6})\s+(\d{2}:\d{2}:\d{2})\s*$")
+
+    # Fee group (Subtotal)
+    subtotal_pat = re.compile(r"^Subtotal:\s*([\d,]+\.\d+)", re.IGNORECASE)
     fee_fields = [
-        "Commission",
-        "Platform Fees",
-        "Trading Activity Fees",
-        "Options Regulatory Fees",
-        "OCC Fees",
-        "Option Settlement Fees",
-        "Consolidated Audit Trail Fees",
-        "Consumption Tax",
-        "Total of Transaction Fee",
+        "Commission", "Platform Fees", "Trading Activity Fees", "Options Regulatory Fees",
+        "OCC Fees", "Option Settlement Fees", "Consolidated Audit Trail Fees",
+        "Consumption Tax", "Total of Transaction Fee"
     ]
 
     current_group_id = 0
     current_group_trade_idx: List[int] = []
 
+    last_date_str: Optional[str] = None
+    last_exchange: str = ""
+
     i = 0
     while i < len(lines):
         line = (lines[i] or "").strip()
 
-        # Fee subtotal block ends a group
+        # Track last seen date from descriptor lines
+        dm = date_pat.search(line)
+        if dm:
+            last_date_str = dm.group(1)
+
+        # Fee subtotal closes group
         sm = subtotal_pat.match(line)
         if sm:
             subtotal_fee = money_to_float(sm.group(1))
+            lookahead = " ".join(lines[i: min(i + 7, len(lines))])
 
-            lookahead = " ".join(lines[i : min(i + 7, len(lines))])
             component_sum = 0.0
             for f in fee_fields:
                 fm = re.search(rf"{re.escape(f)}:\s*([\d,]+\.\d+)", lookahead, flags=re.IGNORECASE)
@@ -238,86 +216,77 @@ def parse_trades_from_text_lines(lines: List[str]) -> Tuple[List[ParsedTrade], L
             i += 1
             continue
 
-        # Trade direction start
-        dm = dir_pat.match(line)
-        if dm:
-            direction = f"{dm.group(1).title()} to {dm.group(2).title()}"
+        # Parse trade line
+        tm = trade_line_pat.match(line)
+        if tm:
+            direction = f"{tm.group(1).title()} to {tm.group(2).title()}"
+            currency = tm.group(3).upper()
+            price = float(tm.group(4))
+            qty = float(tm.group(5))
+            amount = money_to_float(tm.group(6))
 
-            # Build a block (next lines belong to this trade)
-            block = [line]
-            for j in range(1, 12):
-                if i + j >= len(lines):
-                    break
-                nxt = (lines[i + j] or "").strip()
-                if dir_pat.match(nxt) or subtotal_pat.match(nxt) or nxt.startswith("Direction "):
-                    break
-                block.append(nxt)
-
-            block_text = " | ".join(block)
-
-            dt = _extract_datetime_from_block(block_text)
-            if dt is None or pd.isna(dt):
-                i += len(block)
-                continue
-
-            # Currency
-            cur = ""
-            curm = re.search(r"\b(USD|SGD|HKD|CNH|JPY)\b", block_text)
-            if curm:
-                cur = curm.group(1)
-
-            # Exchange (often "US")
+            # Exchange appears in the line sometimes as 'US'
             exch = ""
-            exchm = re.search(r"\b(US|SG|HK)\b", block_text)
+            exchm = re.search(r"\b(US|SG|HK)\b", line)
             if exchm:
                 exch = exchm.group(1)
+                last_exchange = exch
+            else:
+                exch = last_exchange
 
-            # Prefer option code; else ticker
-            # Note: we remove spaces for option code matching (PDF sometimes inserts spaces)
-            opt_codes = re.findall(r"\b[A-Z]+(?:\d{6})[CP]\d+\b", block_text.replace(" ", ""))
-            symbol_code = opt_codes[0] if opt_codes else ""
+            # Next line should contain symbol_code + time (options) OR ticker + time (equity)
+            symbol_code = ""
+            time_str = ""
+            if i + 1 < len(lines):
+                nxt = (lines[i + 1] or "").strip()
 
-            if not symbol_code:
-                # fallback ticker (first ALLCAPS token length 1-6)
-                tm = re.search(r"\b([A-Z]{1,6})\b", block_text)
-                symbol_code = tm.group(1) if tm else ""
+                om = opt_code_time_pat.match(nxt.replace(" ", ""))
+                if om:
+                    symbol_code = om.group(1)
+                    time_str = om.group(2)
+                else:
+                    em = ticker_time_pat.match(nxt)
+                    if em:
+                        symbol_code = em.group(1)
+                        time_str = em.group(2)
 
-            # Extract last numeric triplet: price qty amount
-            # Example: "0.2000 9 180.00"
-            triplets = re.findall(r"(-?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+([\d,]+\.\d+)", block_text)
-            if not triplets:
-                i += len(block)
+            # Build datetime from last_date_str + time_str
+            if last_date_str and time_str and symbol_code:
+                dt = pd.to_datetime(
+                    f"{last_date_str} {time_str}",
+                    format="%Y/%m/%d %H:%M:%S",
+                    errors="coerce"
+                )
+            else:
+                dt = pd.NaT
+
+            if pd.isna(dt):
+                i += 1
                 continue
-            p, q, a = triplets[-1]
-            price = float(p)
-            qty = float(q)
-            amt = money_to_float(a)
 
-            if not symbol_code:
-                i += len(block)
-                continue
-
-            t = ParsedTrade(
-                direction=direction,
-                symbol_code=symbol_code,
-                exchange=exch,
-                currency=cur,
-                datetime=dt,
-                price=price,
-                quantity=qty,
-                amount=amt,
-                fees_alloc=0.0,
-                group_id=current_group_id,
+            trades.append(
+                ParsedTrade(
+                    direction=direction,
+                    symbol_code=symbol_code,
+                    exchange=exch,
+                    currency=currency,
+                    datetime=dt,
+                    price=price,
+                    quantity=qty,
+                    amount=amount,
+                    fees_alloc=0.0,
+                    group_id=current_group_id
+                )
             )
-            trades.append(t)
             current_group_trade_idx.append(len(trades) - 1)
 
-            i += len(block)
+            i += 2  # skip the next line (symbol+time)
             continue
 
         i += 1
 
-    return trades, fee_groups
+    fee_groups_df = pd.DataFrame(fee_groups)
+    return trades, fee_groups_df
 
 
 @st.cache_data(show_spinner=False)
@@ -336,15 +305,18 @@ def parse_moomoo_monthly_pdf(uploaded_bytes: bytes) -> Dict[str, pd.DataFrame]:
     acct = extract_account_summary(all_text)
     account_summary_df = pd.DataFrame([acct]) if acct else pd.DataFrame([{}])
 
-    parsed_trades, fee_groups = parse_trades_from_text_lines(all_lines)
+    parsed_trades, fee_groups_df = parse_trades_from_text_lines(all_lines)
 
-    # Normalize trades
     rows = []
     for t in parsed_trades:
         side = direction_to_side(t.direction)
 
+        # SELL = credit (+), BUY = debit (-)
         gross = float(t.amount)
-        gross = -abs(gross) if side == "BUY" else abs(gross) if side == "SELL" else gross
+        if side == "BUY":
+            gross = -abs(gross)
+        elif side == "SELL":
+            gross = abs(gross)
 
         if is_options_symbol(t.symbol_code):
             opt = parse_option_code(t.symbol_code)
@@ -384,19 +356,15 @@ def parse_moomoo_monthly_pdf(uploaded_bytes: bytes) -> Dict[str, pd.DataFrame]:
         })
 
     trades_df = pd.DataFrame(rows)
-
     if not trades_df.empty:
         trades_df["datetime"] = pd.to_datetime(trades_df["datetime"], errors="coerce")
         trades_df = trades_df.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
         trades_df["expiry"] = pd.to_datetime(trades_df["expiry"], errors="coerce")
 
-    # Include fee group info in a tiny df for debug
-    fee_groups_df = pd.DataFrame(fee_groups)
-
     return {
         "account_summary": account_summary_df,
         "trades": trades_df,
-        "fee_groups": fee_groups_df,
+        "fee_groups": fee_groups_df
     }
 
 
@@ -407,16 +375,12 @@ st.sidebar.header("Upload")
 uploaded = st.sidebar.file_uploader("Upload moomoo Monthly Statement PDF", type=["pdf"])
 
 if uploaded is None:
-    st.markdown(
-        """
-        <div class="card">
-          <h3>Upload your PDF</h3>
-          <div class="sub">Use the sidebar to upload your moomoo monthly statement PDF.</div>
-          <div class="sub">After upload, the dashboard updates instantly.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+    <div class="card">
+      <h3>Upload your PDF</h3>
+      <div class="sub">Upload your moomoo monthly statement PDF in the sidebar.</div>
+    </div>
+    """, unsafe_allow_html=True)
     st.stop()
 
 data = parse_moomoo_monthly_pdf(uploaded.getvalue())
@@ -424,42 +388,17 @@ account_summary = data["account_summary"]
 trades = data["trades"]
 fee_groups = data["fee_groups"]
 
-# quick visible sanity check
 st.sidebar.write("Parsed trades:", int(len(trades)))
 st.sidebar.write("Parsed option trades:", int((trades["instrument_type"] == "option").sum()) if not trades.empty else 0)
 
 # ============================================================
-# Compute KPIs
+# KPIs
 # ============================================================
 options = trades[trades["instrument_type"] == "option"].copy()
-
-# Harden datetime before .dt usage (prevents .dt crash)
 if not options.empty:
     options["datetime"] = pd.to_datetime(options["datetime"], errors="coerce")
     options = options.dropna(subset=["datetime"]).copy()
 
-if options.empty:
-    latest_month = None
-    this_month_net = 0.0
-    week_net = 0.0
-    ytd_net = 0.0
-else:
-    options["date"] = options["datetime"].dt.date
-    options["week"] = options["datetime"].dt.to_period("W").astype(str)
-    options["month"] = options["datetime"].dt.to_period("M").astype(str)
-    options["year"] = options["datetime"].dt.year
-
-    latest_month = options["month"].max()
-    this_month_net = float(options.loc[options["month"] == latest_month, "net_amount"].sum())
-
-    now = pd.Timestamp.now()
-    week_cutoff = now - pd.Timedelta(days=7)
-    week_net = float(options.loc[options["datetime"] >= week_cutoff, "net_amount"].sum())
-
-    ytd_cutoff = pd.Timestamp(year=now.year, month=1, day=1)
-    ytd_net = float(options.loc[options["datetime"] >= ytd_cutoff, "net_amount"].sum())
-
-# Account summary metrics
 def _get_float(df: pd.DataFrame, key: str) -> float:
     if df.empty:
         return np.nan
@@ -477,83 +416,81 @@ nav_start = _get_float(account_summary, "nav_start")
 nav_change = (nav_end - nav_start) if np.isfinite(nav_end) and np.isfinite(nav_start) else np.nan
 nav_change_pct = (nav_change / nav_start * 100.0) if np.isfinite(nav_change) and np.isfinite(nav_start) and nav_start != 0 else np.nan
 
+if options.empty:
+    latest_month = None
+    this_month_net = 0.0
+    week_net = 0.0
+    ytd_net = 0.0
+else:
+    options["week"] = options["datetime"].dt.to_period("W").astype(str)
+    options["month"] = options["datetime"].dt.to_period("M").astype(str)
+
+    latest_month = options["month"].max()
+    this_month_net = float(options.loc[options["month"] == latest_month, "net_amount"].sum())
+
+    now = pd.Timestamp.now()
+    week_cutoff = now - pd.Timedelta(days=7)
+    week_net = float(options.loc[options["datetime"] >= week_cutoff, "net_amount"].sum())
+
+    ytd_cutoff = pd.Timestamp(year=now.year, month=1, day=1)
+    ytd_net = float(options.loc[options["datetime"] >= ytd_cutoff, "net_amount"].sum())
+
 # ============================================================
 # Layout
 # ============================================================
 c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.2], gap="large")
 
 with c1:
-    st.markdown(
-        f"""
-        <div class="card">
-          <h3>Options Net (7d)</h3>
-          <div class="big">${week_net:,.2f}</div>
-          <div class="sub">Net = credits - debits - allocated fees</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"""
+    <div class="card">
+      <h3>Options Net (7d)</h3>
+      <div class="big">${week_net:,.2f}</div>
+      <div class="sub">Net = credits - debits - allocated fees</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 with c2:
-    st.markdown(
-        f"""
-        <div class="card">
-          <h3>Options Net (Month)</h3>
-          <div class="big">${this_month_net:,.2f}</div>
-          <div class="sub">Month: {latest_month or "—"}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"""
+    <div class="card">
+      <h3>Options Net (Month)</h3>
+      <div class="big">${this_month_net:,.2f}</div>
+      <div class="sub">Month: {latest_month or "—"}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 with c3:
-    year_label = str(pd.Timestamp.now().year) + "-01-01"
-    st.markdown(
-        f"""
-        <div class="card">
-          <h3>Options Net (YTD)</h3>
-          <div class="big">${ytd_net:,.2f}</div>
-          <div class="sub">From {year_label}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"""
+    <div class="card">
+      <h3>Options Net (YTD)</h3>
+      <div class="big">${ytd_net:,.2f}</div>
+      <div class="sub">From {pd.Timestamp.now().year}-01-01</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 with c4:
     nav_line = f"${nav_end:,.2f}" if np.isfinite(nav_end) else "—"
     pv_line = f"${portfolio_value:,.2f}" if np.isfinite(portfolio_value) else "—"
     cash_line = f"${cash_balance:,.2f}" if np.isfinite(cash_balance) else "—"
-    chg_line = (
-        f"{nav_change:+,.2f} ({nav_change_pct:+.2f}%)"
-        if np.isfinite(nav_change) and np.isfinite(nav_change_pct)
-        else "—"
-    )
+    chg_line = f"{nav_change:+,.2f} ({nav_change_pct:+.2f}%)" if np.isfinite(nav_change_pct) else "—"
 
-    st.markdown(
-        f"""
-        <div class="card">
-          <h3>Account Summary</h3>
-          <div class="sub">NAV (end): <b>{nav_line}</b></div>
-          <div class="sub">NAV change: <b>{chg_line}</b></div>
-          <div class="sub">Portfolio value: <b>{pv_line}</b></div>
-          <div class="sub">Cash balance: <b>{cash_line}</b></div>
-          <div class="small">Tip: if trades still show 0, expand Debug and check parsed lines.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"""
+    <div class="card">
+      <h3>Account Summary</h3>
+      <div class="sub">NAV (end): <b>{nav_line}</b></div>
+      <div class="sub">NAV change: <b>{chg_line}</b></div>
+      <div class="sub">Portfolio value: <b>{pv_line}</b></div>
+      <div class="sub">Cash balance: <b>{cash_line}</b></div>
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
 left, mid, right = st.columns([1.2, 1.0, 1.0], gap="large")
 
-# ==========================
-# Table: Options trades
-# ==========================
 with left:
     st.markdown("<div class='card'><h3>Parsed Options Trades</h3></div>", unsafe_allow_html=True)
     if options.empty:
-        st.info("No option trades detected in this PDF (yet). See Debug section.")
+        st.info("No option trades detected. Check the Debug section below.")
     else:
         show_cols = [
             "datetime", "direction", "symbol_code", "underlying", "call_put",
@@ -564,9 +501,6 @@ with left:
         show_df["expiry"] = pd.to_datetime(show_df["expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-# ==========================
-# Chart: Net by week
-# ==========================
 with mid:
     st.markdown("<div class='card'><h3>Net Options (Weekly)</h3></div>", unsafe_allow_html=True)
     if options.empty:
@@ -576,9 +510,6 @@ with mid:
         fig = px.bar(weekly, x="week", y="net_amount")
         st.plotly_chart(dark_plot(fig), use_container_width=True)
 
-# ==========================
-# Chart: Net by underlying
-# ==========================
 with right:
     st.markdown("<div class='card'><h3>Net by Underlying</h3></div>", unsafe_allow_html=True)
     if options.empty:
@@ -588,21 +519,12 @@ with right:
         fig = px.bar(by_und, x="underlying", y="net_amount")
         st.plotly_chart(dark_plot(fig), use_container_width=True)
 
-# ============================================================
-# Debug / diagnostics
-# ============================================================
-with st.expander("Debug: Fee allocation groups + raw stats"):
+with st.expander("Debug"):
     st.write("Total parsed trades:", int(len(trades)))
     if not trades.empty:
         st.write("Instrument types:", trades["instrument_type"].value_counts(dropna=False))
-        st.write("Directions seen:", sorted(trades["direction"].dropna().unique().tolist()))
-        st.write("Example rows (first 10):")
-        st.dataframe(trades.head(10), use_container_width=True)
-
-    st.write("Fee allocation groups (from Subtotal blocks):")
+        st.write("Directions:", sorted(trades["direction"].dropna().unique().tolist()))
+        st.write("First 20 trades:")
+        st.dataframe(trades.head(20), use_container_width=True)
+    st.write("Fee groups (from Subtotal blocks):")
     st.dataframe(fee_groups, use_container_width=True)
-
-    st.write("If you still see 0 option trades:")
-    st.write("- Your PDF text extraction might differ (some PDFs are image-based).")
-    st.write("- Try downloading the statement again (some exports are cleaner).")
-    st.write("- If you want, upload another month and we can adjust patterns for consistency.")
