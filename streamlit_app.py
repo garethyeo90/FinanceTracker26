@@ -14,24 +14,38 @@ import streamlit as st
 # ============================================================
 st.set_page_config(page_title="Moomoo Options Dashboard", layout="wide")
 
-st.markdown(
-    """
-    <style>
-      html, body {background-color:#0e1117;}
-      .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-      .card {
-        background: #121417;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 14px;
-        padding: 16px;
-      }
-      .card h3 {margin: 0 0 0.25rem 0; font-size: 0.95rem; color: rgba(255,255,255,0.75);}
-      .big {font-size: 1.9rem; font-weight: 700; margin: 0.15rem 0;}
-      .sub {color: rgba(255,255,255,0.55); font-size: 0.85rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+html, body {
+    background-color: #0e1117;
+}
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 2rem;
+}
+.card {
+    background: #121417;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 16px;
+}
+.card h3 {
+    margin: 0 0 0.25rem 0;
+    font-size: 0.95rem;
+    color: rgba(255,255,255,0.75);
+}
+.big {
+    font-size: 1.9rem;
+    font-weight: 700;
+    margin: 0.15rem 0;
+}
+.sub {
+    color: rgba(255,255,255,0.55);
+    font-size: 0.85rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # ============================================================
 # Helpers
