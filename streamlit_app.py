@@ -4,46 +4,47 @@ import pandas as pd
 from datetime import date
 
 def parse_expiry_yymmdd_to_date(x):
-    """
-    Parses expiry values like 260214 (YYMMDD) into a python date (2026-02-14).
-    Handles strings/numbers, blanks, invalid values safely.
-    """
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return pd.NaT
+    """
+    Parses expiry values like 260214 (YYMMDD) into a python date (2026-02-14).
+    Handles strings/numbers, blanks, invalid values safely.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return pd.NaT
 
-    s = str(x).strip()
+    s = str(x).strip()
 
-    # Some Excel values may come in like '260214.0'
-    if s.endswith(".0"):
-        s = s[:-2]
+    # Some Excel values may come in like '260214.0'
+    if s.endswith(".0"):
+        s = s[:-2]
 
-    # Keep digits only
-    s = "".join(ch for ch in s if ch.isdigit())
+    # Keep digits only
+    s = "".join(ch for ch in s if ch.isdigit())
 
-    if len(s) != 6:
-        return pd.NaT
+    if len(s) != 6:
+        return pd.NaT
 
-    yy = int(s[:2])
-    mm = int(s[2:4])
-    dd = int(s[4:6])
+    yy = int(s[:2])
+    mm = int(s[2:4])
+    dd = int(s[4:6])
 
-    # Choose century rule: 00-79 -> 2000s, 80-99 -> 1900s (common convention)
-    year = 2000 + yy if yy <= 79 else 1900 + yy
+    # Choose century rule: 00-79 -> 2000s, 80-99 -> 1900s (common convention)
+    year = 2000 + yy if yy <= 79 else 1900 + yy
 
-    try:
-        return date(year, mm, dd)
-    except ValueError:
-        return pd.NaT
+    try:
+        return date(year, mm, dd)
+    except ValueError:
+        return pd.NaT
 
 
 def compute_days_to_expiry_from_yymmdd(df: pd.DataFrame) -> pd.Series:
-    if "Expiry" not in df.columns:
-        return pd.Series([pd.NA] * len(df), index=df.index)
+    if "Expiry" not in df.columns:
+        return pd.Series([pd.NA] * len(df), index=df.index)
 
-    today = date.today()
-    exp_dates = df["Expiry"].apply(parse_expiry_yymmdd_to_date)
+    today = date.today()
+    exp_dates = df["Expiry"].apply(parse_expiry_yymmdd_to_date)
 
-    return exp_dates.apply(lambda d: (d - today).days if pd.notna(d) else pd.NA)
+    return exp_dates.apply(lambda d: (d - today).days if pd.notna(d) else pd.NA)
+
 
 # --------------------------------------------------
 # Page config
