@@ -190,6 +190,86 @@ else:
     else:
         st.line_chart(trend_df.set_index("Month")["Plot"], height=350)
 
+
+        # --------------------------------------------------
+# SECTION 3.5 — NAV Projection (next 12 months)
+# --------------------------------------------------
+st.subheader("🔮 NAV Projection (Next 12 Months)")
+
+base_nav = num(acct_m.get("NAV_End_USD"))
+if base_nav <= 0:
+    st.info("NAV projection requires a positive NAV_End_USD in Account_Summary.")
+else:
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+
+    with c1:
+        monthly_flow = st.number_input(
+            "Monthly net flow (USD) — +contribution / -withdrawal",
+            value=0.0,
+            step=10_000.0,
+            format="%.0f",
+            help="Assumed net cash added/removed at the end of each month."
+        )
+
+    with c2:
+        annual_return = st.number_input(
+            "Assumed annual return (%)",
+            value=0.0,
+            step=0.5,
+            format="%.2f",
+            help="Optional. Set to 0 for a straight-line projection with flows only."
+        )
+
+    with c3:
+        flow_timing = st.selectbox(
+            "Flow timing",
+            ["End of month", "Start of month"],
+            index=0,
+            help="Whether monthly_flow is applied before or after the return each month."
+        )
+
+    # Convert annual return to monthly (simple comp; keep it simple/transparent)
+    r_m = (1 + annual_return / 100.0) ** (1/12) - 1
+
+    # Build next 12 months labels
+    try:
+        start_dt = pd.to_datetime(month_label + "-01")
+    except Exception:
+        # Fallback if month_label isn't YYYY-MM
+        start_dt = pd.Timestamp.today().normalize().replace(day=1)
+
+    proj_months = pd.date_range(start=start_dt, periods=13, freq="MS")  # include start + 12 ahead
+    nav = base_nav
+    nav_path = [nav]
+
+    for _ in range(12):
+        if flow_timing == "Start of month":
+            nav = nav + monthly_flow
+            nav = nav * (1 + r_m)
+        else:  # End of month
+            nav = nav * (1 + r_m)
+            nav = nav + monthly_flow
+        nav_path.append(nav)
+
+    proj_df = pd.DataFrame({
+        "Month": proj_months.strftime("%Y-%m"),
+        "Projected_NAV_USD": nav_path
+    })
+
+    # Show KPI + chart
+    end_nav = proj_df["Projected_NAV_USD"].iloc[-1]
+    total_change = end_nav - base_nav
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Starting NAV", f"${base_nav:,.0f}")
+    k2.metric("Projected NAV (12M)", f"${end_nav:,.0f}")
+    k3.metric("Change (12M)", f"${total_change:,.0f}")
+
+    st.line_chart(proj_df.set_index("Month")["Projected_NAV_USD"], height=350)
+
+    with st.expander("Show projection table"):
+        st.dataframe(proj_df, use_container_width=True, height=320)
+
 # --------------------------------------------------
 # SECTION 4 — Risk Alerts (2% rule) + Open Positions Table
 # --------------------------------------------------
