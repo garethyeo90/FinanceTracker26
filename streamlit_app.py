@@ -1,6 +1,50 @@
 import streamlit as st
 import pandas as pd
 
+from datetime import date
+
+def parse_expiry_yymmdd_to_date(x):
+    """
+    Parses expiry values like 260214 (YYMMDD) into a python date (2026-02-14).
+    Handles strings/numbers, blanks, invalid values safely.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return pd.NaT
+
+    s = str(x).strip()
+
+    # Some Excel values may come in like '260214.0'
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    # Keep digits only
+    s = "".join(ch for ch in s if ch.isdigit())
+
+    if len(s) != 6:
+        return pd.NaT
+
+    yy = int(s[:2])
+    mm = int(s[2:4])
+    dd = int(s[4:6])
+
+    # Choose century rule: 00-79 -> 2000s, 80-99 -> 1900s (common convention)
+    year = 2000 + yy if yy <= 79 else 1900 + yy
+
+    try:
+        return date(year, mm, dd)
+    except ValueError:
+        return pd.NaT
+
+
+def compute_days_to_expiry_from_yymmdd(df: pd.DataFrame) -> pd.Series:
+    if "Expiry" not in df.columns:
+        return pd.Series([pd.NA] * len(df), index=df.index)
+
+    today = date.today()
+    exp_dates = df["Expiry"].apply(parse_expiry_yymmdd_to_date)
+
+    return exp_dates.apply(lambda d: (d - today).days if pd.notna(d) else pd.NA)
+
 # --------------------------------------------------
 # Page config
 # --------------------------------------------------
@@ -331,8 +375,65 @@ display_cols = [
 ]
 display_cols = [c for c in display_cols if c in port_m.columns]
 
+# Add Days_to_Expiry (Expiry is YYMMDD)
+port_m["Days_to_Expiry"] = compute_days_to_expiry_from_yymmdd(port_m)
+
+# Recompute thresholds for this month (same as alerts)
+nav_end = num(acct_m.get("NAV_End_USD"))
+
+tmp = port_m.copy()
+tmp["Unrealized_PnL_USD"] = pd.to_numeric(tmp.get("Unrealized_PnL_USD", 0), errors="coerce").fillna(0.0)
+
+# Hard/Soft breach logic only applies to non-cash positions
+open_non_cash = tmp[tmp.get("Asset_Class", "") != "Cash"]
+open_count = max(len(open_non_cash), 1)
+
+hard_threshold = -0.02 * nav_end if nav_end > 0 else float("-inf")
+soft_threshold = (-0.02 * nav_end / open_count) if nav_end > 0 else float("-inf")
+
+tmp["Hard_Breach"] = (tmp.get("Asset_Class", "") != "Cash") & (tmp["Unrealized_PnL_USD"] < hard_threshold)
+tmp["Soft_Breach"] = (tmp.get("Asset_Class", "") != "Cash") & (tmp["Unrealized_PnL_USD"] < soft_threshold)
+
+# Style rows: RED if hard breach OR DTE < 14; AMBER if soft breach (optional)
+def style_row(row):
+    dte = row.get("Days_to_Expiry", pd.NA)
+    hard = bool(row.get("Hard_Breach", False))
+    soft = bool(row.get("Soft_Breach", False))
+
+    if hard or (pd.notna(dte) and dte < 14):
+        return ["background-color: #ffcccc"] * len(row)  # red
+
+    if soft:
+        return ["background-color: #fff2cc"] * len(row)  # amber
+
+    return [""] * len(row)
+
+# Add DTE column into display columns
+display_cols = [
+    "Ticker",
+    "Asset_Class",
+    "Exposure_Class",
+    "Quantity",
+    "Market_Value_USD",
+    "Notional_Value_USD",
+    "Delta_Notional_USD",
+    "Unrealized_PnL_USD",
+    "CSP_Cash_Required_USD",
+    "Expiry",
+    "Days_to_Expiry",
+    "Strategy",
+]
+display_cols = [c for c in display_cols if c in tmp.columns]
+
+# Optional: show a banner count for soon-to-expire positions
+soon = tmp[pd.to_numeric(tmp["Days_to_Expiry"], errors="coerce") < 14]
+if len(soon) > 0:
+    st.warning(f"⏳ {len(soon)} open position(s) expiring within 14 days.")
+
 st.dataframe(
-    port_m[display_cols].sort_values("Market_Value_USD", key=abs, ascending=False),
+    tmp[display_cols]
+      .sort_values("Market_Value_USD", key=abs, ascending=False)
+      .style.apply(style_row, axis=1),
     use_container_width=True,
     height=420
 )
